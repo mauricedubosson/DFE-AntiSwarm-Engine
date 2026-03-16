@@ -1,0 +1,40 @@
+markdown
+# DFE-AS: Hardware Implementation & Servo Specifications
+
+To achieve the precision calculated by the **Dubosson-Feynman Engine**, the physical turret must meet specific torque and speed requirements to track a **Shahed-136** (185 km/h) at close range (500m-1000m).
+
+## 1. Servo Motor Requirements (Pan & Tilt)
+
+To intercept a drone moving at 50 m/s at a 500m distance, the turret must have a minimum angular velocity of **10°/s** with high micro-step precision.
+
+### Recommended Actuators:
+- **Type:** Industrial Integrated Servo Motors (RS485/CANopen communication).
+- **Torque (Pan/Azimuth):** > 20 Nm (for 12.7mm heavy machine guns).
+- **Torque (Tilt/Elevation):** > 10 Nm (balanced with counterweights).
+- **Encoder Resolution:** 16-bit or higher (to match the DFE high-precision lead-point).
+
+**Suggested Models:** 
+- ClearPath SDSK Series (NEMA 34) 
+- JMC Integrated Servo Motors (iHSV86)
+
+## 2. System Architecture (The "Technical" Pickup)
+
+
+| Component | Specification | Function |
+| :--- | :--- | :--- |
+| **Compute Unit** | NVIDIA Jetson Orin Nano | Runs the Dubosson Regulator & Feynman Explorer. |
+| **Microcontroller** | Teensy 4.1 or ESP32 | Translates DFE coordinates into Step/Dir pulses. |
+| **Power Supply** | 24V/48V LiFePO4 Battery | Provides peak current for rapid turret maneuvers. |
+| **Mount** | Dual-axis Gimbal Structure | Stabilizes the weapon against recoil and vehicle vibration. |
+
+## 3. Wiring Logic (Signal Flow)
+
+1. **Radar/Acoustic Input:** Raw signal sent to the Jetson Orin.
+2. **DFE Processing:** The `DubossonRegulator` filters noise; `FeynmanExplorer` calculates the **Lead Point**.
+3. **Control Output:** Jetson sends `(Azimuth, Elevation)` target angles to the Microcontroller via Serial/CAN.
+4. **Motion:** Microcontroller triggers the Servos to align the barrel.
+5. **Fire Control:** Solenoid trigger is activated when `AngularError < 0.1°`.
+
+## 4. Ballistic Calibration
+The `InterceptionEngine` in `main.py` assumes a muzzle velocity ($V_b$) of **820 m/s** (standard .50 cal / 12.7mm). 
+- **Important:** If using 7.62mm ($V_b \approx 715$ m/s), update the `v_bullet` parameter in the code to avoid undershooting.
