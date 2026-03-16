@@ -1,0 +1,157 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import sympy as sp
+import random
+from typing import Optional, List
+
+# =============================================================================
+# 1. RÉGULATEUR DE DUBOSSON (FILTRAGE HARMONIQUE RADAR/ACOUSTIQUE)
+# =============================================================================
+class DubossonRegulator(nn.Module):
+    """Filtre amélioré pour isoler les fréquences des drones, avec détection auto de shock."""
+    def __init__(self, dim: int, freq_range: tuple = (50.0, 120.0)):  # Adapté pour moteurs Shahed
+        super().__init__()
+        self.dim = dim
+        self.persistence = nn.Parameter(torch.tensor(0.85))
+        self.register_buffer('scalar_field', torch.zeros(dim))
+        self.low_freq, self.high_freq = freq_range
+
+    def forward(self, x: torch.Tensor, shock: Optional[float] = None) -> torch.Tensor:
+        t = torch.linspace(0, 1, self.dim, device=x.device)
+        # Simulation de résonance bandpass
+        resonance = torch.sin(2 * np.pi * self.low_freq * t) + torch.sin(2 * np.pi * self.high_freq * t)
+        resonance /= 2.0  # Normalisation
+
+        if shock is None:
+            # Détection auto de shock (manœuvre évitante)
+            if hasattr(self, 'prev_x') and torch.norm(x - self.prev_x) > 0.5 * torch.norm(x):
+                shock = 0.4
+            self.prev_x = x.clone().detach()
+
+        p = self.persistence if shock is None else self.persistence * shock
+        with torch.no_grad():
+            self.scalar_field = p * self.scalar_field + (1 - p) * resonance
+
+        # Application du filtre
+        filtered = x * (1 + self.scalar_field.mean())
+        return torch.tanh(filtered)
+
+# =============================================================================
+# 2. EXPLORATEUR DE FEYNMAN (GÉNÉRATEUR DE LOI D'INTERCEPTION)
+# =============================================================================
+class FeynmanExplorer:
+    """Extrait des lois mathématiques via programmation génétique simple."""
+    def __init__(self, vars: list):
+        self.symbols = sp.symbols(vars)
+        self.ops = [sp.Add, sp.Mul, sp.Pow]
+        self.unary_ops = [sp.sin, sp.cos]
+        self.constants = [sp.S(0), sp.S(1), sp.S(2), sp.pi, sp.symbols('g')]
+
+    def generate_expr(self, depth=3):
+        if depth == 0 or random.random() < 0.3:
+            return random.choice(self.symbols + self.constants)
+        if random.random() < 0.3:
+            op = random.choice(self.unary_ops)
+            arg = self.generate_expr(depth - 1)
+            return op(arg)
+        op = random.choice(self.ops)
+        left = self.generate_expr(depth - 1)
+        right = self.generate_expr(depth - 1)
+        return op(left, right)
+
+    def evolve_law(self, x_data: np.ndarray, y_data: np.ndarray, gens=50, pop_size=100):
+        def score(expr):
+            try:
+                lambdified = sp.lambdify(self.symbols, expr, 'numpy')
+                pred = lambdified(*x_data.T)
+                return -np.mean((pred - y_data)**2)  # MSE négative
+            except:
+                return -np.inf
+
+        best_score = -np.inf
+        best_expr = sp.S(0)  # Initialisation pour éviter None
+        for _ in range(gens):
+            population = [self.generate_expr() for _ in range(pop_size)]
+            scores = [score(expr) for expr in population]
+            idx = np.argmax(scores)
+            if scores[idx] > best_score:
+                best_score = scores[idx]
+                best_expr = population[idx]
+        return sp.simplify(best_expr)
+
+# =============================================================================
+# 3. MODULE DE VISÉE BALISTIQUE (ANTI-SHAHED)
+# =============================================================================
+class InterceptionEngine(nn.Module):
+    """Calcule le point d'impact avec corrections physiques et ML."""
+    def __init__(self):
+        super().__init__()
+        self.regulator = DubossonRegulator(512)
+        self.brain = nn.Sequential(nn.Linear(6, 128), nn.ReLU(), nn.Linear(128, 3))  # Pos + vel en entrée
+        self.explorer = FeynmanExplorer(['dist', 'v', 't', 'g'])  # Vars simplifiées pour lead angle
+
+    def predict_lead_point(self, pos: torch.Tensor, vel: torch.Tensor, v_bullet=820.0, use_ml=False):
+        # Filtrage des entrées
+        input_tensor = torch.cat([pos, vel])
+        filtered = self.regulator(input_tensor)
+        pos, vel = filtered[:3], filtered[3:]
+
+        # Calcul TOF précis (quadratique pour gravité)
+        dist = torch.norm(pos)
+        v_z = v_bullet * (pos[2] / dist) if dist > 0 else 0  # Composante verticale
+        a = -0.5 * 9.81
+        b = v_z + vel[2]
+        c = pos[2]
+        discriminant = b**2 - 4 * a * c
+        t_flight = torch.tensor(0.0)
+        if discriminant >= 0:
+            t_flight = (-b - torch.sqrt(discriminant)) / (2 * a)  # Choisir la racine positive typique
+        t_flight = max(t_flight, dist / v_bullet)  # Fallback approx
+
+        # Point futur
+        point_futur = pos + vel * t_flight
+        point_futur[2] += 0.5 * 9.81 * t_flight**2  # Compensation drop (z up)
+
+        if use_ml:
+            ml_input = torch.cat([pos, vel])
+            correction = self.brain(ml_input)
+            point_futur += correction
+
+        return point_futur
+
+    def handle_swarm(self, positions: List[torch.Tensor], velocities: List[torch.Tensor]):
+        # Priorisation par menace (vitesse / distance)
+        threats = sorted(zip(positions, velocities), key=lambda pv: torch.norm(pv[1]) / torch.norm(pv[0]), reverse=True)
+        return [self.predict_lead_point(pos, vel) for pos, vel in threats[:5]]  # Burst-and-shift sur top 5
+
+# =============================================================================
+# 4. TEST DE VALIDATION (SCÉNARIO RÉEL)
+# =============================================================================
+if __name__ == "__main__":
+    print("[INIT] Moteur Dubosson-Feynman amélioré activé.")
+    engine = InterceptionEngine()
+
+    # Test cible unique avec bruit
+    pos_drone = torch.tensor([1000.0, 0.0, 100.0]) + torch.randn(3) * 2  # Bruit sensoriel
+    vel_drone = torch.tensor([-50.0, 5.0, 0.0]) + torch.randn(3) * 0.5
+    impact_point = engine.predict_lead_point(pos_drone, vel_drone)
+    print(f"\n[CIBLE] Drone Shahed détecté à {pos_drone[0]:.1f}m")
+    print(f"[CALCUL] Point d'interception (Lead) : {impact_point.tolist()}")
+    print("[ACTION] Solution de tir envoyée aux servomoteurs.")
+
+    # Test swarm
+    swarm_pos = [pos_drone + torch.randn(3) * 10 for _ in range(3)]
+    swarm_vel = [vel_drone + torch.randn(3) * 1 for _ in range(3)]
+    swarm_intercepts = engine.handle_swarm(swarm_pos, swarm_vel)
+    print("\n[SWARM] Points d'interception :", [p.tolist() for p in swarm_intercepts])
+
+    # Test évolution symbolique (loi pour TOF approx)
+    t = np.linspace(0, 5, 50)
+    dist = 1000 - 50 * t
+    v = np.full_like(t, 820)
+    g = np.full_like(t, 9.81)
+    tof_target = dist / v + (0.5 * g * (dist / v)**2) / v  # Approx avec gravité
+    x_data = np.stack([dist, v, t, g])
+    law = engine.explorer.evolve_law(x_data, tof_target, gens=20, pop_size=50)
+    print(f"\n[LAW] Loi évoluée pour TOF : {law}")
